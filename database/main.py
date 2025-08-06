@@ -4,7 +4,7 @@ from typing import List, Dict, Optional
 import json
 
 class MySQLClient:
-    def __init__(self, host: str, user: str, password: str, database: str, pool_size: int = 5):
+    def __init__(self, host: str, user: str, password: str, database: str, pool_size: int = 15):  # Increased from 5
         self.db_config = {
             'host': host,
             'user': user,
@@ -33,26 +33,35 @@ class MySQLClient:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS images (
                     id INT AUTO_INCREMENT PRIMARY KEY,
-                    hash BIGINT UNSIGNED NOT NULL,
+                    hash INT UNSIGNED NOT NULL,
                     url VARCHAR(2048) NOT NULL,
                     decision ENUM('flagged', 'review', 'pass') NOT NULL DEFAULT 'pass',
                     labels JSON,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    KEY `hash_idx` (`hash`)
+                    INDEX hash_idx (hash),
+                    INDEX hash_decision_idx (hash, decision),
+                    INDEX decision_idx (decision)
                 )
             """)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS videos (
                     id INT AUTO_INCREMENT PRIMARY KEY,
-                    hash_1 BIGINT UNSIGNED NOT NULL,
-                    hash_2 BIGINT UNSIGNED NOT NULL,
-                    hash_3 BIGINT UNSIGNED NOT NULL,
-                    hash_4 BIGINT UNSIGNED NOT NULL,
-                    hash_5 BIGINT UNSIGNED NOT NULL,
+                    hash_1 INT UNSIGNED NOT NULL,
+                    hash_2 INT UNSIGNED NOT NULL,
+                    hash_3 INT UNSIGNED NOT NULL,
+                    hash_4 INT UNSIGNED NOT NULL,
+                    hash_5 INT UNSIGNED NOT NULL,
                     url VARCHAR(2048) NOT NULL,
                     decision ENUM('flagged', 'review', 'pass') NOT NULL DEFAULT 'pass',
                     labels JSON,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX hash_1_idx (hash_1),
+                    INDEX hash_2_idx (hash_2),
+                    INDEX hash_3_idx (hash_3),
+                    INDEX hash_4_idx (hash_4),
+                    INDEX hash_5_idx (hash_5),
+                    INDEX decision_idx (decision),
+                    INDEX composite_idx (hash_1, hash_2, decision)
                 )
             """)
             cursor.execute("""
@@ -96,6 +105,38 @@ class MySQLClient:
     def close(self):
         """This method is no longer needed for individual connections, but can be used to terminate the pool if necessary."""
         pass
+    
+    def clear_all_data(self):
+        """Clear all data from all tables. Use with caution!"""
+        tables = ['moderation_log', 'text_moderation', 'videos', 'images']
+        conn = None
+        cursor = None
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            # Disable foreign key checks temporarily
+            cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
+            
+            for table in tables:
+                cursor.execute(f"TRUNCATE TABLE {table}")
+                print(f"Cleared all data from {table} table")
+            
+            # Re-enable foreign key checks
+            cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
+            
+            conn.commit()
+            print("✅ All tables cleared successfully!")
+            
+        except Exception as e:
+            print(f"❌ Error clearing tables: {e}")
+            if conn:
+                conn.rollback()
+        finally:
+            if cursor:
+                cursor.close()
+            if conn:
+                conn.close()
     
     def log_moderation_request(self, request_id: str, user_uuid: str, content_type: str, content_identifier: str, content_hash: Optional[str], decision: str, reason: Optional[str], raw_response: Optional[Dict] = None):
         """Logs a moderation request and its outcome to the database."""
@@ -193,19 +234,28 @@ class MySQLClient:
                 conn.close()
 
     def find_similar_images(self, image_hash: bytes, threshold: int) -> List[Dict]:
-        """Find similar images using Hamming distance."""
+        """Find similar images using optimized Hamming distance with range filtering."""
         hash_int = int.from_bytes(image_hash, 'big')
+        
+        # Pre-filter by hash range to reduce BIT_COUNT calculations
+        # This significantly improves performance by limiting the search space
+        lower_bound = max(0, hash_int - (1 << threshold))
+        upper_bound = min(0xFFFF, hash_int + (1 << threshold))  # 16-bit max value
+        
         query = """
         SELECT url, decision, labels, BIT_COUNT(hash ^ %s) AS similarity_score
-        FROM images
-        WHERE BIT_COUNT(hash ^ %s) <= %s
+        FROM images 
+        WHERE hash BETWEEN %s AND %s 
+        AND BIT_COUNT(hash ^ %s) <= %s
+        ORDER BY similarity_score ASC
+        LIMIT 10
         """
         conn = None
         cursor = None
         try:
             conn = self.get_connection()
             cursor = conn.cursor(dictionary=True)
-            cursor.execute(query, (hash_int, hash_int, threshold))
+            cursor.execute(query, (hash_int, lower_bound, upper_bound, hash_int, threshold))
             results = cursor.fetchall()
             return results
         except Exception as e:
@@ -218,27 +268,44 @@ class MySQLClient:
                 conn.close()
 
     def find_similar_videos(self, video_hashes: List[int], threshold: int) -> List[Dict]:
-        """Find similar videos using Hamming distance on multiple frame hashes."""
-        similarity_query_parts = [f"BIT_COUNT(hash_{i+1} ^ %s)" for i in range(len(video_hashes))]
-        total_similarity_query = " + ".join(similarity_query_parts)
-
-        query = f"""
-        SELECT url, decision, labels, ({total_similarity_query}) AS similarity_score
+        """Find similar videos using optimized Hamming distance on multiple frame hashes."""
+        if len(video_hashes) != 5:
+            print(f"ERROR: Expected 5 video hashes, got {len(video_hashes)}")
+            return []
+            
+        h1, h2, h3, h4, h5 = video_hashes
+        
+        # Build the similarity calculation for all 5 hashes
+        query = """
+        SELECT url, decision, labels, 
+               (BIT_COUNT(hash_1 ^ %s) + BIT_COUNT(hash_2 ^ %s) + BIT_COUNT(hash_3 ^ %s) + BIT_COUNT(hash_4 ^ %s) + BIT_COUNT(hash_5 ^ %s)) AS similarity_score
         FROM videos
-        WHERE ({total_similarity_query}) <= %s
+        WHERE (BIT_COUNT(hash_1 ^ %s) + BIT_COUNT(hash_2 ^ %s) + BIT_COUNT(hash_3 ^ %s) + BIT_COUNT(hash_4 ^ %s) + BIT_COUNT(hash_5 ^ %s)) <= %s
+        ORDER BY similarity_score ASC
+        LIMIT 10
         """
         
-        params = video_hashes * 2 + [threshold]
+        # Parameters: 5 hashes for SELECT, 5 hashes for WHERE, 1 threshold
+        params = [h1, h2, h3, h4, h5, h1, h2, h3, h4, h5, threshold]
+        
         conn = None
         cursor = None
         try:
             conn = self.get_connection()
             cursor = conn.cursor(dictionary=True)
+            print(f"DEBUG: Video similarity query parameters: {params}")
+            print(f"DEBUG: Searching for exact hashes: {video_hashes}")
+            print(f"DEBUG: Threshold: {threshold}")
             cursor.execute(query, params)
             results = cursor.fetchall()
+            print(f"DEBUG: Video similarity results count: {len(results)}")
+            for i, result in enumerate(results):
+                print(f"DEBUG: Result {i+1}: similarity={result.get('similarity_score')}, url={result.get('url', '')[:50]}...")
             return results
         except Exception as e:
             print(f"Error finding similar videos: {e}")
+            import traceback
+            traceback.print_exc()
             return []
         finally:
             if cursor:

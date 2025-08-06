@@ -16,7 +16,7 @@ class VideoAnalysis:
         
         # Check if URL is accessible (similar to image module)
         try:
-            response = requests.head(url, timeout=10)
+            response = requests.head(url, timeout=15)  # Increased timeout
             if response.status_code not in [200, 206]:  # 206 is for partial content (range requests)
                 raise ValueError(f"Failed to access video from {url}. Status code: {response.status_code}")
         except requests.exceptions.RequestException as e:
@@ -69,8 +69,8 @@ class VideoAnalysis:
             if ret:
                 # Convert frame to PIL Image for hashing
                 pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                # Generate perceptual hash and convert to integer
-                phash = imagehash.phash(pil_img)
+                # Generate perceptual hash with optimized size and convert to integer
+                phash = imagehash.phash(pil_img, hash_size=4)  # 16-bit hash for better performance
                 hashes.append(int(str(phash), 16))
         
         cap.release()
@@ -102,11 +102,16 @@ class VideoAnalysis:
                 similar_videos = db_connection.find_similar_videos(video_hashes, similarity_threshold)
                 if similar_videos:
                     self._cleanup_temp_file()
+                    # Use the decision from the existing similar video instead of always flagging
+                    existing_decision = similar_videos[0]["decision"]
+                    existing_labels = similar_videos[0]["labels"]
+                    
                     return {
                         "is_duplicate": True,
                         "similar_items": similar_videos,
-                        "decision": "flagged",
-                        "reason": "duplicate_video"
+                        "decision": existing_decision,  # Use existing decision (pass/review/flagged)
+                        "reason": f"duplicate_video_{existing_decision}",  # More descriptive reason
+                        "review_details": json.loads(existing_labels) if existing_labels else {}
                     }
             
             # 3. If not a duplicate, perform full frame analysis

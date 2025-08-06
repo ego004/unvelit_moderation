@@ -10,11 +10,12 @@ from io import BytesIO
 class ImageAnalysis():
     def __init__(self, url: str = ""):
         self.url = url
-        respone = requests.get(url)
-        if respone.status_code != 200:
-            raise ValueError(f"Failed to fetch image from {url}. Status code: {respone.status_code}")
-        self.image_hash = imagehash.phash(Image.open(BytesIO(respone.content)))  # Using a hash size of 16 for better performance
-        print(f"Image hash: {self.image_hash}")
+        response = requests.get(url, timeout=30)  # Added timeout
+        if response.status_code != 200:
+            raise ValueError(f"Failed to fetch image from {url}. Status code: {response.status_code}")
+        # Use smaller hash size (4x4 = 16-bit) for better performance and storage efficiency
+        self.image_hash = imagehash.phash(Image.open(BytesIO(response.content)), hash_size=4)
+        print(f"Image hash (16-bit): {self.image_hash}")
 
     def analyse(self, db_connection, similarity_threshold: int = 8, 
                table_name: str = "images", save_to_db: bool = True) -> Dict:
@@ -32,18 +33,23 @@ class ImageAnalysis():
         """
         # Find similar images in the database
         hash_int = int(str(self.image_hash), 16)  # Convert imagehash to integer
-        hash_bytes = hash_int.to_bytes(8, 'big')  # 64-bit hash = 8 bytes
+        hash_bytes = hash_int.to_bytes(2, 'big')  # 16-bit hash = 2 bytes (optimized from 8 bytes)
         similar_images = db_connection.find_similar_images(
             hash_bytes, 
             threshold=similarity_threshold
         )
 
         if similar_images:
+            # Use the decision from the existing similar image instead of always flagging
+            existing_decision = similar_images[0]["decision"]
+            existing_labels = similar_images[0]["labels"]
+            
             return {
                 "is_duplicate": True,
                 "similar_items": [{"url": image["url"], "similarity": image["similarity_score"], "labels": image["labels"]} for image in similar_images],
-                "decision": "flagged",
-                "reason": "duplicate_image"
+                "decision": existing_decision,  # Use existing decision (pass/review/flagged)
+                "reason": f"duplicate_image_{existing_decision}",  # More descriptive reason
+                "review_details": json.loads(existing_labels) if existing_labels else {}
             }
         
         else:
@@ -60,9 +66,9 @@ class ImageAnalysis():
                 
                 # Save to database regardless of decision (per user requirements)
                 if save_to_db:
-                    # Convert imagehash to integer for database storage
+                    # Convert imagehash to integer for database storage (16-bit optimized)
                     hash_int = int(str(self.image_hash), 16)  # imagehash string is hexadecimal
-                    hash_bytes = hash_int.to_bytes(8, 'big')  # 64-bit hash = 8 bytes
+                    hash_bytes = hash_int.to_bytes(2, 'big')  # 16-bit hash = 2 bytes
                     db_connection.save_image_hash(hash_bytes, self.url, result['decision'], json.dumps(result['review_details']))
                 
                 return {

@@ -49,34 +49,43 @@ class TextAnalysis:
         """
         context_str = "\n".join(f"- {msg}" for msg in self.thread_context)
         
-        return f"""
-        You are a content moderator for a social media platform. Your task is to analyze a new message for any violations of our community standards, based on the context of the preceding conversation.
+        return f"""You are a content moderator for a social media platform. You must analyze messages for community standard violations.
 
-        **Community Standards:** Do not allow:
-        - Hate speech (attacks on race, religion, ethnicity, etc.)
-        - Harassment or personal attacks
-        - Threats of violence
-        - Explicitly sexual content
+CRITICAL: You MUST respond with ONLY a valid JSON object. No markdown, no explanations, no additional text.
 
-        **Conversation Thread (for context):**
-        {context_str}
+COMMUNITY STANDARDS - Flag content that contains:
+- Hate speech (attacks on race, religion, ethnicity, nationality, sexual orientation, gender identity)
+- Harassment or personal attacks (insults, name-calling, bullying)
+- Threats of violence (direct or implied threats of harm)
+- Explicit sexual content (graphic sexual descriptions, solicitation)
+- Spam or commercial solicitation
+- Doxxing or sharing private information
 
-        **New Message to Analyze:**
-        "{self.text}"
+CONVERSATION CONTEXT:
+{context_str}
 
-        **Your Analysis:**
-        Based on the community standards and the conversation context, analyze the new message. Respond with a JSON object containing your decision. The JSON object must have two keys:
-        1. "decision": A string that is one of "pass", "review", or "flagged".
-        2. "reason": A brief, one-sentence explanation for your decision.
+MESSAGE TO ANALYZE:
+"{self.text}"
 
-        Example Response:
-        {{
-          "decision": "flagged",
-          "reason": "The message contains a personal attack against another user."
-        }}
+DECISION RULES:
+- "pass": Content is appropriate and follows community standards
+- "review": Content is borderline and needs human review (mild profanity, heated debate, unclear intent)
+- "flagged": Content clearly violates community standards
 
-        Provide only the JSON object in your response.
-        """
+REQUIRED OUTPUT FORMAT:
+You must respond with EXACTLY this JSON structure (no other text):
+
+{{
+  "decision": "pass|review|flagged",
+  "reason": "Brief explanation in one sentence"
+}}
+
+EXAMPLES:
+For harassment: {{"decision": "flagged", "reason": "Contains personal attacks and insults directed at another user"}}
+For debate: {{"decision": "pass", "reason": "Expresses disagreement respectfully without personal attacks"}}
+For borderline: {{"decision": "review", "reason": "Contains strong language that may require human judgment"}}
+
+Analyze the message and respond with ONLY the JSON object:"""
 
     def _call_gemini_api(self, prompt: str) -> Dict:
         """
@@ -98,19 +107,63 @@ class TextAnalysis:
 
     def _parse_gemini_response(self, response: Dict) -> Dict:
         """
-        Parse the JSON response from the Gemini API.
+        Parse the JSON response from the Gemini API with robust error handling.
         """
-        # Extract the text content which should be a JSON string
-        content_text = response['candidates'][0]['content']['parts'][0]['text']
-        
-        # Clean up the response to ensure it's valid JSON
-        clean_json_str = content_text.strip().replace("```json", "").replace("```", "").strip()
-        
-        # Parse the JSON string into a Python dictionary
-        moderation_data = json.loads(clean_json_str)
-        
-        # Validate the parsed data
-        if "decision" not in moderation_data or "reason" not in moderation_data:
-            raise ValueError("Invalid JSON structure in response")
+        try:
+            # Extract the text content which should be a JSON string
+            content_text = response['candidates'][0]['content']['parts'][0]['text']
             
-        return moderation_data
+            # Clean up the response to ensure it's valid JSON
+            clean_json_str = content_text.strip()
+            
+            # Remove markdown code blocks if present
+            if clean_json_str.startswith("```json"):
+                clean_json_str = clean_json_str[7:]
+            elif clean_json_str.startswith("```"):
+                clean_json_str = clean_json_str[3:]
+            if clean_json_str.endswith("```"):
+                clean_json_str = clean_json_str[:-3]
+            
+            clean_json_str = clean_json_str.strip()
+            
+            # Remove any leading/trailing text that isn't JSON
+            start_idx = clean_json_str.find('{')
+            end_idx = clean_json_str.rfind('}')
+            
+            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                clean_json_str = clean_json_str[start_idx:end_idx + 1]
+            else:
+                raise ValueError("No valid JSON object found in response")
+            
+            # Parse the JSON string into a Python dictionary
+            moderation_data = json.loads(clean_json_str)
+            
+            # Validate the parsed data structure
+            if not isinstance(moderation_data, dict):
+                raise ValueError("Response is not a JSON object")
+                
+            if "decision" not in moderation_data:
+                raise ValueError("Missing 'decision' field in response")
+                
+            if "reason" not in moderation_data:
+                raise ValueError("Missing 'reason' field in response")
+            
+            # Validate decision values
+            valid_decisions = ["pass", "review", "flagged"]
+            if moderation_data["decision"] not in valid_decisions:
+                # If invalid decision, default to review for safety
+                moderation_data["decision"] = "review"
+                moderation_data["reason"] = f"Invalid decision format: {moderation_data['decision']}"
+            
+            # Ensure reason is a string
+            if not isinstance(moderation_data["reason"], str):
+                moderation_data["reason"] = str(moderation_data["reason"])
+            
+            return moderation_data
+            
+        except (json.JSONDecodeError, KeyError, IndexError, ValueError) as e:
+            # If parsing fails completely, return a safe default response
+            return {
+                "decision": "review",
+                "reason": f"AI response parsing failed - flagged for manual review (Error: {str(e)})"
+            }

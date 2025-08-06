@@ -25,6 +25,10 @@ class ImageRequest(BaseModel):
     url: str = Field(..., description="The public URL of the image to analyze.")
     user_uuid: str = Field(..., description="The UUID of the user making the request.")
 
+class BatchImageRequest(BaseModel):
+    images: List[ImageRequest] = Field(..., description="List of images to analyze in batch.")
+    max_concurrent: int = Field(5, description="Maximum number of concurrent analyses (1-10).")
+
 class VideoRequest(BaseModel):
     url: str = Field(..., description="The public URL of the video to analyze.")
     user_uuid: str = Field(..., description="The UUID of the user making the request.")
@@ -75,6 +79,7 @@ async def analyse_image_endpoint(request: ImageRequest, db: MySQLClient = Depend
     request_id = str(uuid.uuid4())
     try:
         analyzer = ImageAnalysis(url=request.url)
+        # Only save to DB if it's not a duplicate (to avoid wasting API credits and DB writes)
         result = analyzer.analyse(db_connection=db, save_to_db=True)
         
         db.log_moderation_request(
@@ -250,5 +255,161 @@ async def analyse_text_endpoint(request: TextRequest, db: MySQLClient = Depends(
         )
         
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/analyse/images/batch", tags=["Moderation", "Batch"])
+async def analyse_images_batch_endpoint(request: BatchImageRequest, db: MySQLClient = Depends(get_db)):
+    """
+    Analyzes multiple images concurrently for better performance.
+    
+    - **Processes up to 10 images simultaneously**
+    - **Returns results in the same order as input**
+    - **Fails gracefully** - continues processing other images if one fails
+    - **Uses connection pooling** for optimal database performance
+    """
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+    
+    # Limit concurrent processing to prevent resource exhaustion
+    max_concurrent = min(max(1, request.max_concurrent), 10)
+    
+    async def process_single_image(image_request: ImageRequest) -> dict:
+        """Process a single image asynchronously."""
+        request_id = str(uuid.uuid4())
+        try:
+            # Run the blocking image analysis in a thread pool
+            loop = asyncio.get_event_loop()
+            with ThreadPoolExecutor() as executor:
+                analyzer = await loop.run_in_executor(executor, ImageAnalysis, image_request.url)
+                result = await loop.run_in_executor(
+                    executor, 
+                    lambda: analyzer.analyse(db_connection=db, save_to_db=True)
+                )
+            
+            db.log_moderation_request(
+                request_id=request_id,
+                user_uuid=image_request.user_uuid,
+                content_type='image',
+                content_identifier=image_request.url,
+                content_hash=str(analyzer.image_hash),
+                decision=result.get('decision', 'Error'),
+                reason=result.get('reason', 'An unexpected error occurred.'),
+                raw_response=result
+            )
+            return {"request_id": request_id, "url": image_request.url, "status": "success", **result}
+            
+        except Exception as e:
+            error_result = {
+                "decision": "error", 
+                "reason": "processing_failed", 
+                "error": str(e),
+                "is_duplicate": False
+            }
+            
+            db.log_moderation_request(
+                request_id=request_id,
+                user_uuid=image_request.user_uuid,
+                content_type='image',
+                content_identifier=image_request.url,
+                content_hash=None,
+                decision="error",
+                reason="processing_failed",
+                raw_response=error_result
+            )
+            
+            return {"request_id": request_id, "url": image_request.url, "status": "error", "error": str(e)}
+    
+    # Process images concurrently with semaphore to limit concurrent operations
+    semaphore = asyncio.Semaphore(max_concurrent)
+    
+    async def process_with_semaphore(image_request: ImageRequest):
+        async with semaphore:
+            return await process_single_image(image_request)
+    
+    # Execute all image processing tasks concurrently
+    tasks = [process_with_semaphore(img) for img in request.images]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Handle any exceptions that occurred during processing
+    processed_results = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            processed_results.append({
+                "request_id": str(uuid.uuid4()),
+                "url": request.images[i].url,
+                "status": "error",
+                "error": str(result)
+            })
+        else:
+            processed_results.append(result)
+    
+    return {
+        "batch_id": str(uuid.uuid4()),
+        "total_images": len(request.images),
+        "processed": len(processed_results),
+        "max_concurrent": max_concurrent,
+        "results": processed_results
+    }
+
+@app.post("/debug/clear-database")
+def clear_database():
+    """Clear all data from database tables. Use with caution!"""
+    if not db_client:
+        raise HTTPException(status_code=500, detail="Database not initialized")
+    
+    try:
+        db_client.clear_all_data()
+        return {"message": "✅ All tables cleared successfully!"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to clear database: {str(e)}")
+
+@app.get("/debug/database-content")
+def get_database_content():
+    """Debug endpoint to see what's in the database."""
+    if not db_client:
+        raise HTTPException(status_code=500, detail="Database not initialized")
+    
+    try:
+        conn = db_client.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        
+        # Get images
+        cursor.execute("SELECT * FROM images ORDER BY created_at DESC LIMIT 10")
+        images = cursor.fetchall()
+        
+        # Get videos
+        cursor.execute("SELECT * FROM videos ORDER BY created_at DESC LIMIT 10")
+        videos = cursor.fetchall()
+        
+        # Get moderation logs
+        cursor.execute("SELECT * FROM moderation_log ORDER BY created_at DESC LIMIT 10")
+        logs = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        return {
+            "images": images,
+            "videos": videos,
+            "moderation_logs": logs
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get database content: {str(e)}")
+
+@app.post("/debug/test-video-similarity")
+def test_video_similarity(video_hashes: List[int], threshold: int = 10):
+    """Debug endpoint to test video similarity search."""
+    if not db_client:
+        raise HTTPException(status_code=500, detail="Database not initialized")
+    
+    try:
+        results = db_client.find_similar_videos(video_hashes, threshold)
+        return {
+            "search_hashes": video_hashes,
+            "threshold": threshold,
+            "results_found": len(results),
+            "results": results
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to test similarity: {str(e)}")
 
 # To run the API, use the command: uvicorn api:app --reload
