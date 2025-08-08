@@ -13,11 +13,17 @@ from text.main import TextAnalysis
 # Load environment variables from .env file
 load_dotenv()
 
+
+from fastapi import APIRouter
+
 app = FastAPI(
     title="Unvelit Moderation API",
     description="API for moderating images, videos, and text content.",
     version="1.0.0",
 )
+
+# Create a router for all endpoints
+router = APIRouter()
 
 # --- Pydantic Models for Request Bodies ---
 
@@ -65,7 +71,7 @@ def get_db() -> MySQLClient:
 
 # --- API Endpoints ---
 
-@app.post("/analyse/image", tags=["Moderation"])
+@router.post("/analyse/image", tags=["Moderation"])
 async def analyse_image_endpoint(request: ImageRequest, db: MySQLClient = Depends(get_db)):
     """
     Analyzes an image for duplicate content and inappropriate material.
@@ -136,7 +142,7 @@ async def analyse_image_endpoint(request: ImageRequest, db: MySQLClient = Depend
         
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/analyse/video", tags=["Moderation"])
+@router.post("/analyse/video", tags=["Moderation"])
 async def analyse_video_endpoint(request: VideoRequest, db: MySQLClient = Depends(get_db)):
     """
     Analyzes a video for duplicate content and inappropriate material.
@@ -210,7 +216,7 @@ async def analyse_video_endpoint(request: VideoRequest, db: MySQLClient = Depend
         
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/analyse/text", tags=["Moderation"])
+@router.post("/analyse/text", tags=["Moderation"])
 async def analyse_text_endpoint(request: TextRequest, db: MySQLClient = Depends(get_db)):
     """
     Analyzes text for community standard violations using the Gemini API.
@@ -256,7 +262,7 @@ async def analyse_text_endpoint(request: TextRequest, db: MySQLClient = Depends(
         
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/analyse/images/batch", tags=["Moderation", "Batch"])
+@router.post("/analyse/images/batch", tags=["Moderation", "Batch"])
 async def analyse_images_batch_endpoint(request: BatchImageRequest, db: MySQLClient = Depends(get_db)):
     """
     Analyzes multiple images concurrently for better performance.
@@ -350,7 +356,7 @@ async def analyse_images_batch_endpoint(request: BatchImageRequest, db: MySQLCli
         "results": processed_results
     }
 
-@app.post("/debug/clear-database")
+@router.post("/debug/clear-database")
 def clear_database():
     """Clear all data from database tables. Use with caution!"""
     if not db_client:
@@ -362,7 +368,7 @@ def clear_database():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to clear database: {str(e)}")
 
-@app.get("/debug/database-content")
+@router.get("/debug/database-content")
 def get_database_content():
     """Debug endpoint to see what's in the database."""
     if not db_client:
@@ -395,7 +401,7 @@ def get_database_content():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get database content: {str(e)}")
 
-@app.post("/debug/test-video-similarity")
+@router.post("/debug/test-video-similarity")
 def test_video_similarity(video_hashes: List[int], threshold: int = 10):
     """Debug endpoint to test video similarity search."""
     if not db_client:
@@ -411,5 +417,9 @@ def test_video_similarity(video_hashes: List[int], threshold: int = 10):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to test similarity: {str(e)}")
+
+
+# Register the router with the prefix '/unvelit_mod'
+app.include_router(router, prefix="/unvelit_mod")
 
 # To run the API, use the command: uvicorn api:app --reload
