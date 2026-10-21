@@ -8,14 +8,26 @@ import requests
 from io import BytesIO
 
 class ImageAnalysis():
-    def __init__(self, url: str = ""):
+    # 64-bit pHash (8x8 DCT). A 16-bit hash has only 65,536 values: with a
+    # threshold of 8 bits, about 60% of unrelated image pairs "match", and a
+    # new upload would inherit some other image's verdict (including "pass").
+    # At 64 bits and a threshold of 8, unrelated images essentially never
+    # match, while re-encodes, resizes and light edits land within 0-6 bits.
+    HASH_SIZE = 8
+
+    def __init__(self, url: str = "", content: bytes = None):
         self.url = url
-        response = requests.get(url, timeout=30)  # Added timeout
-        if response.status_code != 200:
-            raise ValueError(f"Failed to fetch image from {url}. Status code: {response.status_code}")
-        # Use smaller hash size (4x4 = 16-bit) for better performance and storage efficiency
-        self.image_hash = imagehash.phash(Image.open(BytesIO(response.content)), hash_size=4)
-        print(f"Image hash (16-bit): {self.image_hash}")
+        if content is None:
+            response = requests.get(url, timeout=30)  # Added timeout
+            if response.status_code != 200:
+                raise ValueError(f"Failed to fetch image from {url}. Status code: {response.status_code}")
+            content = response.content
+        self.image_hash = imagehash.phash(Image.open(BytesIO(content)), hash_size=self.HASH_SIZE)
+        print(f"Image hash (64-bit): {self.image_hash}")
+
+    @property
+    def hash_bytes(self) -> bytes:
+        return int(str(self.image_hash), 16).to_bytes(8, 'big')
 
     def analyse(self, db_connection, similarity_threshold: int = 8, 
                table_name: str = "images", save_to_db: bool = True) -> Dict:
@@ -32,10 +44,8 @@ class ImageAnalysis():
             Dict: Analysis results including similar images and similarity scores
         """
         # Find similar images in the database
-        hash_int = int(str(self.image_hash), 16)  # Convert imagehash to integer
-        hash_bytes = hash_int.to_bytes(2, 'big')  # 16-bit hash = 2 bytes (optimized from 8 bytes)
         similar_images = db_connection.find_similar_images(
-            hash_bytes, 
+            self.hash_bytes, 
             threshold=similarity_threshold
         )
 
@@ -66,10 +76,7 @@ class ImageAnalysis():
                 
                 # Save to database regardless of decision (per user requirements)
                 if save_to_db:
-                    # Convert imagehash to integer for database storage (16-bit optimized)
-                    hash_int = int(str(self.image_hash), 16)  # imagehash string is hexadecimal
-                    hash_bytes = hash_int.to_bytes(2, 'big')  # 16-bit hash = 2 bytes
-                    db_connection.save_image_hash(hash_bytes, self.url, result['decision'], json.dumps(result['review_details']))
+                    db_connection.save_image_hash(self.hash_bytes, self.url, result['decision'], json.dumps(result['review_details']))
                 
                 return {
                     "is_duplicate": False,

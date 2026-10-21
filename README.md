@@ -2,7 +2,7 @@
 
 Content moderation service I built for Unvelit, an anonymous college forum. Anonymous posting plus image uploads is a risky combination, so every upload — image, video or text — goes through this API before it becomes visible.
 
-The part I care about most is the duplicate detection. Media that was already moderated once shouldn't cost money to moderate again: every image gets a 16-bit perceptual hash, and near-duplicate lookup happens directly in MySQL using `BIT_COUNT(stored_hash ^ candidate)` as the Hamming distance — no vector database, no extra service. A repost of an already-rejected image gets blocked without ever hitting the paid moderation API (SightEngine).
+The part I care about most is the duplicate detection. Media that was already moderated once shouldn't cost money to moderate again: every image gets a 64-bit perceptual hash, and near-duplicate lookup happens directly in MySQL using `BIT_COUNT(stored_hash ^ candidate)` as the Hamming distance — no vector database, no extra service. A repost of an already-rejected image gets blocked without ever hitting the paid moderation API (SightEngine).
 
 ## How it works
 
@@ -22,4 +22,4 @@ cp .env.example .env   # MySQL credentials + SightEngine/Gemini keys
 uvicorn api:app
 ```
 
-`comprehensive_duplicate_test.py` exercises the dedup path end to end. Notes from the optimization passes are in [PERFORMANCE_OPTIMIZATIONS.md](PERFORMANCE_OPTIMIZATIONS.md).
+`demo/dedup_demo.py` shows the dedup path against a local MySQL with no API keys (see [DEMO.md](DEMO.md)); `comprehensive_duplicate_test.py` exercises it end to end through the API. Notes from the optimization passes are in [PERFORMANCE_OPTIMIZATIONS.md](PERFORMANCE_OPTIMIZATIONS.md).

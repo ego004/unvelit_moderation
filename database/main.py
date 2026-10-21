@@ -33,7 +33,8 @@ class MySQLClient:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS images (
                     id INT AUTO_INCREMENT PRIMARY KEY,
-                    hash INT UNSIGNED NOT NULL,
+                    hash BIGINT UNSIGNED NOT NULL,
+                    hash_bits TINYINT UNSIGNED NOT NULL DEFAULT 64,
                     url VARCHAR(2048) NOT NULL,
                     decision ENUM('flagged', 'review', 'pass') NOT NULL DEFAULT 'pass',
                     labels JSON,
@@ -43,6 +44,18 @@ class MySQLClient:
                     INDEX decision_idx (decision)
                 )
             """)
+            # Tables created before the switch to 64-bit image hashes hold 16-bit
+            # values in an INT column. Widen the column and tag the old rows, which
+            # are then ignored by lookups (a 16-bit hash cannot be compared with a
+            # 64-bit one); they stay in place as an audit record.
+            cursor.execute("""
+                SELECT COUNT(*) FROM information_schema.columns
+                WHERE table_schema = DATABASE() AND table_name = 'images' AND column_name = 'hash_bits'
+            """)
+            if cursor.fetchone()[0] == 0:
+                cursor.execute("ALTER TABLE images MODIFY hash BIGINT UNSIGNED NOT NULL, "
+                               "ADD COLUMN hash_bits TINYINT UNSIGNED NOT NULL DEFAULT 16 AFTER hash")
+                cursor.execute("ALTER TABLE images ALTER COLUMN hash_bits SET DEFAULT 64")
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS videos (
                     id INT AUTO_INCREMENT PRIMARY KEY,
@@ -190,7 +203,7 @@ class MySQLClient:
     def save_image_hash(self, image_hash: bytes, url: str, decision: str, labels: str):
         """Save an image hash to the database with moderation decision."""
         hash_value = int.from_bytes(image_hash, 'big', signed=False)
-        query = "INSERT INTO images (hash, url, decision, labels) VALUES (%s, %s, %s, %s)"
+        query = "INSERT INTO images (hash, hash_bits, url, decision, labels) VALUES (%s, 64, %s, %s, %s)"
         conn = None
         cursor = None
         try:
@@ -234,18 +247,19 @@ class MySQLClient:
                 conn.close()
 
     def find_similar_images(self, image_hash: bytes, threshold: int) -> List[Dict]:
-        """Find similar images using optimized Hamming distance with range filtering."""
+        """Find near-duplicate images: Hamming distance between 64-bit pHashes.
+
+        No numeric range pre-filter: hashes one bit apart can be far apart as
+        numbers (flip the top bit and the value moves by 2^63), so a BETWEEN
+        window silently misses real duplicates. BIT_COUNT over a BIGINT is a
+        single popcount per row, which MySQL scans quickly into the millions.
+        """
         hash_int = int.from_bytes(image_hash, 'big')
-        
-        # Pre-filter by hash range to reduce BIT_COUNT calculations
-        # This significantly improves performance by limiting the search space
-        lower_bound = max(0, hash_int - (1 << threshold))
-        upper_bound = min(0xFFFF, hash_int + (1 << threshold))  # 16-bit max value
-        
+
         query = """
         SELECT url, decision, labels, BIT_COUNT(hash ^ %s) AS similarity_score
-        FROM images 
-        WHERE hash BETWEEN %s AND %s 
+        FROM images
+        WHERE hash_bits = 64
         AND BIT_COUNT(hash ^ %s) <= %s
         ORDER BY similarity_score ASC
         LIMIT 10
@@ -255,7 +269,7 @@ class MySQLClient:
         try:
             conn = self.get_connection()
             cursor = conn.cursor(dictionary=True)
-            cursor.execute(query, (hash_int, lower_bound, upper_bound, hash_int, threshold))
+            cursor.execute(query, (hash_int, hash_int, threshold))
             results = cursor.fetchall()
             return results
         except Exception as e:

@@ -1,3 +1,8 @@
+> **Update:** image hashes are back to 64 bits. At 16 bits with a threshold of 8, roughly 60% of unrelated
+> image pairs counted as duplicates, so new uploads inherited other images' verdicts; the numeric range
+> pre-filter also missed real duplicates. See DEMO.md. Video still uses five 16-bit frame hashes, compared
+> as an 80-bit total, where false matches are negligible.
+
 # Performance Optimization Plan 🚀
 
 ## Current Status ✅
